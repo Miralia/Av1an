@@ -9,7 +9,6 @@ use std::{
 
 use anyhow::{bail, ensure};
 use itertools::{chain, Itertools};
-use path_abs::PathInfo;
 use serde::{Deserialize, Serialize};
 use strum::{EnumString, IntoStaticStr};
 use tracing::warn;
@@ -54,6 +53,27 @@ fn parse_log_level_value(param: &str, next_param: Option<&String>) -> Option<(St
     None
 }
 
+fn parse_encoder_log_level(level: &str, encoder: Encoder) -> Option<i32> {
+    if let Ok(level) = level.parse::<i32>() {
+        let maximum = if encoder == Encoder::x265 { 4 } else { 3 };
+        return (-1..=maximum).contains(&level).then_some(level);
+    }
+
+    match level {
+        "none" => Some(-1),
+        "error" => Some(0),
+        "warning" => Some(1),
+        "info" => Some(2),
+        "debug" => Some(3),
+        "full" if encoder == Encoder::x265 => Some(4),
+        _ => None,
+    }
+}
+
+fn log_level_produces_statistics(level: &str, encoder: Encoder) -> bool {
+    parse_encoder_log_level(level, encoder).is_some_and(|level| level >= 2)
+}
+
 fn parse_path_value(
     flag: &str,
     param: &str,
@@ -70,16 +90,33 @@ fn parse_path_value(
     None
 }
 
-fn intercept_encoder_log_args(params: &[String], encoder: Encoder) -> InterceptedEncoderLogArgs {
+fn intercept_encoder_log_args(
+    params: &[String],
+    encoder: Encoder,
+) -> anyhow::Result<InterceptedEncoderLogArgs> {
     let mut cleaned = Vec::with_capacity(params.len());
     let mut skip_next = false;
     let mut text_log_file = None;
     let mut x265_csv_file = None;
     let mut log_level = None;
+    let mut log_file_level = None;
 
     for (i, param) in params.iter().enumerate() {
         if skip_next {
             skip_next = false;
+            continue;
+        }
+
+        if let Some((level, consumes_next)) =
+            parse_path_value("--log-file-level", param, params.get(i + 1))
+        {
+            let normalized_level = level.to_ascii_lowercase();
+            ensure!(
+                parse_encoder_log_level(&normalized_level, encoder).is_some(),
+                "Invalid --log-file-level value `{level}` for {encoder}"
+            );
+            log_file_level = Some(normalized_level);
+            skip_next = consumes_next;
             continue;
         }
 
@@ -91,22 +128,12 @@ fn intercept_encoder_log_args(params: &[String], encoder: Encoder) -> Intercepte
             continue;
         }
 
-        if encoder == Encoder::x265 {
-            if let Some((path, consumes_next)) = parse_path_value("--csv", param, params.get(i + 1))
-            {
-                x265_csv_file = Some(path);
-                skip_next = consumes_next;
-                continue;
-            }
-
-            if param == "--csv-log-level" {
-                skip_next = params.get(i + 1).is_some();
-                continue;
-            }
-
-            if param.starts_with("--csv-log-level=") {
-                continue;
-            }
+        if encoder == Encoder::x265
+            && let Some((path, consumes_next)) = parse_path_value("--csv", param, params.get(i + 1))
+        {
+            x265_csv_file = Some(path);
+            skip_next = consumes_next;
+            continue;
         }
 
         if let Some((level, consumes_next)) = parse_log_level_value(param, params.get(i + 1)) {
@@ -122,20 +149,34 @@ fn intercept_encoder_log_args(params: &[String], encoder: Encoder) -> Intercepte
         cleaned.push(param.clone());
     }
 
+    let stderr_log_level =
+        log_level.as_deref().and_then(|level| parse_encoder_log_level(level, encoder));
     let merge_text_log = if x265_csv_file.is_some() {
         false
-    } else if let Some(level) = log_level.as_deref() {
-        matches!(level, "info" | "debug" | "full")
+    } else if text_log_file.is_some() {
+        log_file_level
+            .as_deref()
+            .is_none_or(|level| log_level_produces_statistics(level, encoder))
     } else {
-        text_log_file.is_some()
+        stderr_log_level.is_some_and(|level| level >= 2)
     };
 
-    InterceptedEncoderLogArgs {
+    let needs_info_capture = match (log_level.as_deref(), stderr_log_level) {
+        (_, Some(level)) => level < 2,
+        (None, None) => true,
+        (Some(_), None) => false,
+    };
+    if merge_text_log && needs_info_capture {
+        cleaned.push("--log-level".to_string());
+        cleaned.push("info".to_string());
+    }
+
+    Ok(InterceptedEncoderLogArgs {
         params: cleaned,
         text_log_file,
         x265_csv_file,
         merge_text_log,
-    }
+    })
 }
 
 #[derive(EnumString, IntoStaticStr, Debug, PartialEq, Clone, Copy)]
@@ -257,7 +298,6 @@ pub struct EncodeArgs {
 
     // Intercepted --log-file from user params
     pub user_log_file:   Option<String>,
-    pub x265_csv_file:   Option<String>,
     pub merge_text_logs: bool,
 }
 
@@ -444,24 +484,17 @@ impl EncodeArgs {
         // Intercept encoder log-output options to prevent concurrent writes
         // from workers.
         if self.encoder == Encoder::x264 || self.encoder == Encoder::x265 {
-            let intercepted = intercept_encoder_log_args(&self.video_params, self.encoder);
+            let intercepted = intercept_encoder_log_args(&self.video_params, self.encoder)?;
             self.video_params = intercepted.params;
             self.merge_text_logs = intercepted.merge_text_log;
-            self.x265_csv_file = intercepted.x265_csv_file;
 
             if let Some(lf) = intercepted.text_log_file {
                 let trimmed = lf.trim_matches(|c| c == '"' || c == '\'');
-                let p = Path::new(trimmed);
-                if p.is_absolute() {
-                    self.user_log_file = Some(trimmed.to_string());
-                } else if let Ok(cwd) = std::env::current_dir() {
-                    self.user_log_file = Some(cwd.join(p).to_string_lossy().to_string());
-                } else {
-                    self.user_log_file = Some(trimmed.to_string());
-                }
+                self.user_log_file =
+                    Some(absolute(Path::new(trimmed))?.to_string_lossy().to_string());
             }
 
-            if self.x265_csv_file.is_some() {
+            if intercepted.x265_csv_file.is_some() {
                 bail!(
                     "x265 CSV logging is not supported with av1an chunked encoding yet; use \
                      `--log-file` text output instead"
@@ -745,96 +778,18 @@ pub(crate) fn insert_noise_table_params(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use crate::{
-        concat::ConcatMethod,
-        encoder::Encoder,
-        ffmpeg::FFPixelFormat,
-        settings::{EncodeArgs, InputPixelFormat, PixelFormat},
-        target_quality::TargetQuality,
-        vapoursynth::CacheSource,
-        ChunkMethod,
-        ChunkOrdering,
-        Input,
-        PixelFormatConverter,
-        ScenecutMethod,
-        SplitMethod,
-        Verbosity,
-    };
-
-    fn test_args(video_params: Vec<String>) -> EncodeArgs {
-        EncodeArgs {
-            input: Input::Video {
-                path:         PathBuf::new(),
-                temp:         String::new(),
-                chunk_method: ChunkMethod::LSMASH,
-                is_proxy:     false,
-                cache_mode:   CacheSource::SOURCE,
-            },
-            proxy: None,
-            temp: String::new(),
-            output_file: String::new(),
-            chunk_method: ChunkMethod::LSMASH,
-            chunk_order: ChunkOrdering::Random,
-            scaler: String::new(),
-            scenes: None,
-            split_method: SplitMethod::AvScenechange,
-            sc_pix_format: None,
-            sc_method: ScenecutMethod::Standard,
-            sc_only: false,
-            sc_downscale_height: None,
-            extra_splits_len: None,
-            min_scene_len: 10,
-            force_keyframes: Vec::new(),
-            ignore_frame_mismatch: false,
-            max_tries: 3,
-            passes: 1,
-            video_params,
-            tiles: (1, 1),
-            encoder: Encoder::x265,
-            workers: 1,
-            set_thread_affinity: None,
-            photon_noise: None,
-            photon_noise_size: (None, None),
-            chroma_noise: false,
-            zones: None,
-            cache_mode: CacheSource::SOURCE,
-            pix_format_converter: PixelFormatConverter::FFMPEG,
-            ffmpeg_filter_args: Vec::new(),
-            audio_params: Vec::new(),
-            input_pix_format: InputPixelFormat::FFmpeg {
-                format: FFPixelFormat::YUV420P10LE,
-            },
-            output_pix_format: PixelFormat {
-                format:    FFPixelFormat::YUV420P10LE,
-                bit_depth: 10,
-            },
-            verbosity: Verbosity::Normal,
-            resume: false,
-            keep: false,
-            force: false,
-            no_defaults: false,
-            tile_auto: false,
-            concat: ConcatMethod::FFmpeg,
-            target_quality: TargetQuality::default("", Encoder::x265),
-            vmaf: false,
-            vmaf_path: None,
-            vmaf_res: "1920x1080".to_string(),
-            probe_res: None,
-            vmaf_threads: None,
-            vmaf_filter: None,
-            vapoursynth_plugins: None,
-            user_log_file: None,
-            x265_csv_file: None,
-            merge_text_logs: false,
-        }
-    }
+    use crate::encoder::Encoder;
 
     #[test]
     fn x265_csv_does_not_request_text_log_merge() {
-        let args = test_args(vec!["--csv".to_string(), "stats.csv".to_string()]);
-        assert!(!args.params_indicate_logging());
+        let intercepted = super::intercept_encoder_log_args(
+            &["--csv".to_string(), "stats.csv".to_string()],
+            Encoder::x265,
+        )
+        .expect("log arguments should intercept");
+
+        assert!(intercepted.x265_csv_file.is_some());
+        assert!(!intercepted.merge_text_log);
     }
 
     #[test]
@@ -842,23 +797,32 @@ mod tests {
         let intercepted = super::intercept_encoder_log_args(
             &["--log-file=chunked.log".to_string()],
             Encoder::x264,
-        );
+        )
+        .expect("log arguments should intercept");
 
         assert_eq!(intercepted.text_log_file.as_deref(), Some("chunked.log"));
         assert!(intercepted.merge_text_log);
-        assert!(intercepted.params.is_empty());
+        assert_eq!(intercepted.params, vec![
+            "--log-level".to_string(),
+            "info".to_string()
+        ]);
     }
 
     #[test]
-    fn log_file_with_disabled_log_level_does_not_merge_text_logs() {
+    fn log_file_with_low_stderr_log_level_still_merges_text_logs() {
         let intercepted = super::intercept_encoder_log_args(
             &["--log-file=chunked.log".to_string(), "--log-level=none".to_string()],
             Encoder::x264,
-        );
+        )
+        .expect("log arguments should intercept");
 
         assert_eq!(intercepted.text_log_file.as_deref(), Some("chunked.log"));
-        assert_eq!(intercepted.params, vec!["--log-level=none".to_string()]);
-        assert!(!intercepted.merge_text_log);
+        assert_eq!(intercepted.params, vec![
+            "--log-level=none".to_string(),
+            "--log-level".to_string(),
+            "info".to_string()
+        ]);
+        assert!(intercepted.merge_text_log);
     }
 
     #[test]
@@ -866,7 +830,8 @@ mod tests {
         let intercepted = super::intercept_encoder_log_args(
             &["--log-level=info".to_string(), "--crf=20".to_string()],
             Encoder::x264,
-        );
+        )
+        .expect("log arguments should intercept");
 
         assert_eq!(intercepted.params, vec![
             "--log-level=info".to_string(),
@@ -880,7 +845,55 @@ mod tests {
         let intercepted = super::intercept_encoder_log_args(
             &["--log-level".to_string(), "info".to_string()],
             Encoder::x264,
-        );
+        )
+        .expect("log arguments should intercept");
+
+        assert_eq!(intercepted.params, vec![
+            "--log-level".to_string(),
+            "info".to_string()
+        ]);
+        assert!(intercepted.merge_text_log);
+    }
+
+    #[test]
+    fn numeric_x265_info_log_level_requests_text_log_merge() {
+        let intercepted = super::intercept_encoder_log_args(
+            &["--log-level".to_string(), "2".to_string()],
+            Encoder::x265,
+        )
+        .expect("log arguments should intercept");
+
+        assert!(intercepted.merge_text_log);
+    }
+
+    #[test]
+    fn log_file_level_controls_text_log_merge() {
+        let intercepted = super::intercept_encoder_log_args(
+            &["--log-file=chunked.log".to_string(), "--log-file-level=error".to_string()],
+            Encoder::x264,
+        )
+        .expect("log arguments should intercept");
+
+        assert!(intercepted.params.is_empty());
+        assert!(!intercepted.merge_text_log);
+    }
+
+    #[test]
+    fn invalid_log_file_level_is_rejected() {
+        assert!(super::intercept_encoder_log_args(
+            &["--log-file-level=verbose".to_string()],
+            Encoder::x265,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn log_file_without_log_level_raises_internal_capture_to_info() {
+        let intercepted = super::intercept_encoder_log_args(
+            &["--log-file".to_string(), "chunked.log".to_string()],
+            Encoder::x265,
+        )
+        .expect("log arguments should intercept");
 
         assert_eq!(intercepted.params, vec![
             "--log-level".to_string(),

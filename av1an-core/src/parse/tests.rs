@@ -78,7 +78,8 @@ fn x26x_parsing() {
             "[42.5%] 121/285 frames, 2.47 fps, 1445.28 kb/s, eta 0:01:06",
             Some(121),
         ),
-        // Patman's x264 mod prints the encoder name and a different set of columns
+        // Patman's x264 mod prints the encoder name and a different set of
+        // columns
         (
             "x264 [38.2%] 844/2208 frames @ 115.7 fps | 2930.1 kb/s | 0:00:07 [-0:00:11] | 12.89 \
              MB [33.73 MB]",
@@ -88,8 +89,8 @@ fn x26x_parsing() {
             "x264 844 frames @ 115.7 fps | 2930.1 kb/s | 12.89 MB",
             Some(844),
         ),
-        // Patman's x264 prints this when the total frame count is unknown, which
-        // is the case when av1an feeds the encoder through a y4m pipe.
+        // Patman's x264 prints this when the total frame count is unknown,
+        // which is the case when av1an feeds the encoder through a y4m pipe.
         (
             "x264 112 frames @ 184.3 fps | 298.17 kb/s | 139.1 KB",
             Some(112),
@@ -118,6 +119,15 @@ fn x26x_parsing() {
         (
             "x265 [INFO]: cabac=1 ref=5 bframes=3 b_pyramid=2 b_adapt=1 weightb=1 keyint=250",
             None,
+        ),
+        (
+            "x265 [INFO]:HEVC encoder version 4.1+197-5d1a05e5e [Mod by Patman]\n[42.5%] 121/285 \
+             Frames @ 2.47 FPS",
+            Some(121),
+        ),
+        (
+            "[1.0%] 1/112 Frames @ 2.47 FPS\r[2.0%] 2/112 Frames @ 4.94 FPS",
+            Some(2),
         ),
         ("invalid data", None),
         ("", None),

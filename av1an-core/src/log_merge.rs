@@ -29,7 +29,15 @@ use std::{
     path::Path,
 };
 
-use crate::{parse::starts_with_ignore_ascii_case, EncodeSummaryStats};
+use crate::parse::starts_with_ignore_ascii_case;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EncodeSummaryStats {
+    pub total_frames:   usize,
+    pub media_seconds:  f64,
+    pub encode_seconds: f64,
+    pub total_bytes:    u64,
+}
 
 /// Order in which the frame types are reported by both encoders.
 const FRAME_TYPES: [char; 3] = ['I', 'P', 'B'];
@@ -136,6 +144,7 @@ pub struct LogMerger {
     summary_encode_secs: f64,
     /// How the encoder reports its encoding time, detected from the chunk logs.
     encode_time_style:   Option<EncodeTimeStyle>,
+    output_file:         Option<String>,
 }
 
 impl LogMerger {
@@ -152,7 +161,13 @@ impl LogMerger {
             summary_media_secs:  0.0,
             summary_encode_secs: 0.0,
             encode_time_style:   None,
+            output_file:         None,
         }
+    }
+
+    pub fn with_output_file(mut self, output_file: impl Into<String>) -> Self {
+        self.output_file = Some(output_file.into());
+        self
     }
 
     /// Reads one per-chunk encoder log and folds it into the merged statistics.
@@ -186,7 +201,7 @@ impl LogMerger {
             // that belongs to a chunk's statistics block is never
             // repeated either.
             if self.capturing_headers() && !is_chunk_statistics_line(trimmed) {
-                self.headers.push(trimmed.to_string());
+                self.headers.push(self.normalize_header_line(trimmed));
             }
         }
 
@@ -197,6 +212,23 @@ impl LogMerger {
         }
 
         Ok(())
+    }
+
+    fn normalize_header_line(&self, line: &str) -> String {
+        const OUTPUT_FILE_TAG: &str = "output file:";
+
+        if let Some(output_file) = &self.output_file {
+            let lowercase = line.to_ascii_lowercase();
+            if let Some(index) = lowercase.find(OUTPUT_FILE_TAG) {
+                let end = index + OUTPUT_FILE_TAG.len();
+                return line.get(..end).map_or_else(
+                    || line.to_string(),
+                    |prefix| format!("{prefix} {output_file}"),
+                );
+            }
+        }
+
+        line.to_string()
     }
 
     /// Headers are only collected until the statistics block of the first chunk
@@ -318,6 +350,7 @@ impl LogMerger {
         true
     }
 
+    #[cfg(test)]
     /// Writes the merged log, deriving the summary from the parsed chunk logs.
     pub fn write_merged<W: Write>(&self, writer: W) -> io::Result<()> {
         let inferred_summary = self.inferred_summary();
@@ -334,6 +367,7 @@ impl LogMerger {
         self.write_merged_inner(writer, Some(summary))
     }
 
+    #[cfg(test)]
     /// Summary reconstructed from the chunk logs alone, used when av1an's own
     /// statistics are unavailable.
     fn inferred_summary(&self) -> Option<EncodeSummaryStats> {
@@ -451,8 +485,9 @@ impl LogMerger {
                     "encoded {total_frames} frames, {fps:.2} fps, {kbps:.2} kb/s{duration}"
                 )?;
             },
-            // x265: "encoded %d frames in %.2fs (%.2f fps), %.2f kb/s, Avg QP:%2.2lf"
-            // Patman's x265 reports the time as "%02d:%02d:%02d.%03d" instead.
+            // x265: "encoded %d frames in %.2fs (%.2f fps), %.2f kb/s, Avg
+            // QP:%2.2lf" Patman's x265 reports the time as
+            // "%02d:%02d:%02d.%03d" instead.
             LogFormat::X265 => {
                 let avg_qp = if parsed_frames > 0 {
                     self.frames.iter().map(|frame| frame.qp_sum).sum::<f64>() / parsed_frames as f64
@@ -570,6 +605,10 @@ pub(crate) fn is_encoder_progress_line(line: &str) -> bool {
 
     // ffmpeg/vspipe style progress, e.g. "frame= 100 fps=25 time=00:00:04.00".
     if trimmed.contains("time=") {
+        return true;
+    }
+
+    if trimmed.contains("frame=") && trimmed.contains("QP=") {
         return true;
     }
 
@@ -729,8 +768,12 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{is_encoder_progress_line, should_capture_chunk_log_line, LogMerger};
-    use crate::EncodeSummaryStats;
+    use super::{
+        is_encoder_progress_line,
+        should_capture_chunk_log_line,
+        EncodeSummaryStats,
+        LogMerger,
+    };
 
     /// Real x264 0.165 log of a 120 frame encode, including the progress lines
     /// that x264 writes to stderr.
@@ -1169,6 +1212,34 @@ encoded 120 frames, 291.97 fps, 297.76 kb/s, duration 0:00:00.41
     }
 
     #[test]
+    fn x265_output_file_header_is_rewritten_to_the_final_output() {
+        let dir = TempDir::new().expect("temp dir should exist");
+        let chunk = write_temp_log(&dir, "log_0.log", X265_CHUNK_0);
+        let mut merger = LogMerger::new("x265").with_output_file("final-output.mkv");
+        merger.process_chunk(&chunk).expect("chunk should parse");
+
+        let mut output = Vec::new();
+        merger
+            .write_merged_with_summary(&mut output, &EncodeSummaryStats {
+                total_frames:   120,
+                media_seconds:  4.0,
+                encode_seconds: 1.39,
+                total_bytes:    100_000,
+            })
+            .expect("merged log should write");
+        let output = String::from_utf8(output).expect("merged log should be utf8");
+
+        assert!(
+            output.contains(
+                "raw  [info]: output file: final-output.mkv
+"
+            ),
+            "{output}"
+        );
+        assert!(!output.contains("out265.hevc"), "{output}");
+    }
+
+    #[test]
     fn progress_lines_are_not_captured_but_statistics_are() {
         for progress in [
             "[42.5%] 121/285 frames, 2.47 fps, 1445.28 kb/s, eta 0:01:06",
@@ -1176,6 +1247,7 @@ encoded 120 frames, 291.97 fps, 297.76 kb/s, duration 0:00:00.41
              MB [33.73 MB]",
             "121 frames: 2.47 fps, 1445.28 kb/s",
             "x264 112 frames @ 184.3 fps | 298.17 kb/s | 139.1 KB",
+            "x264 [debug]: frame=   0 QP=20.00 NAL=3 Slice:I Poc:0   I:330  P:0    SKIP:0                 size=38296 bytes",
             "[38.2%] 844/2208 Frames @ 115.7 FPS | 2930.1 kb/s | 0:00:07 [-0:00:11] | 12.89 MB \
              [33.73 MB]",
             "844 Frames @ 115.7 FPS | 2930.1 kb/s | 12.89 MB",

@@ -261,7 +261,11 @@ pub fn parse_svt_av1_frames(input: &str) -> Option<u64> {
 /// encoded 844 frames, 115.7 fps, 2930.1 kb/s                    (summary)
 /// ```
 pub fn parse_x26x_frames(s: &str) -> Option<u64> {
-    let mut parts = s.split_ascii_whitespace();
+    s.split(['\r', '\n']).filter_map(parse_x26x_frames_line).next_back()
+}
+
+fn parse_x26x_frames_line(line: &str) -> Option<u64> {
+    let mut parts = line.split_ascii_whitespace();
     while let Some(part) = parts.next() {
         if part == "encoded" {
             return parts
@@ -275,7 +279,7 @@ pub fn parse_x26x_frames(s: &str) -> Option<u64> {
     // the frame rate, where the first number is the amount of output
     // frames.
     let mut previous: Option<&str> = None;
-    for part in s.split_ascii_whitespace() {
+    for part in line.split_ascii_whitespace() {
         if starts_with_ignore_ascii_case(part, "frames") {
             return previous
                 .map(|candidate: &str| candidate.split_once('/').map_or(candidate, |(val, _)| val))

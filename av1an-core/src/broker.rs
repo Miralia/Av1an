@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::thread::available_parallelism;
 use std::{
     fmt::{Debug, Display},
     fs::File,
@@ -9,12 +11,12 @@ use std::{
         mpsc::Sender,
         Arc,
     },
-    // thread::available_parallelism,
 };
 
 use anyhow::bail;
 use cfg_if::cfg_if;
-// use smallvec::SmallVec;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use smallvec::SmallVec;
 use thiserror::Error;
 use tracing::{debug, error, warn};
 
@@ -152,10 +154,10 @@ impl Broker<'_> {
                                         if threads == 0 {
                                             warn!("Ignoring set_thread_affinity: Requested 0 threads");
                                         } else {
-                                            match std::thread::available_parallelism() {
+                                            match available_parallelism() {
                                                 Ok(parallelism) => {
                                                     let available_threads = parallelism.get();
-                                                    let mut cpu_set = smallvec::SmallVec::<[usize; 16]>::new();
+                                                    let mut cpu_set = SmallVec::<[usize; 16]>::new();
                                                     let start_thread = (threads * worker_id) % available_threads;
                                                     cpu_set.extend((start_thread..start_thread + threads).map(|t| t % available_threads));
                                                     if let Err(e) = affinity::set_thread_affinity(&cpu_set) {
@@ -257,6 +259,7 @@ impl Broker<'_> {
                 && chunk.target_quality.probing_rate == 1
                 && self.project.args.ffmpeg_filter_args.is_empty()
                 && chunk.proxy.is_none()
+                && !self.project.args.params_indicate_logging()
                 && let Some(optimal_q) = chunk.tq_cq
             {
                 let extension = match self.project.args.encoder {

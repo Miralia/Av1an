@@ -32,9 +32,9 @@ use crate::{
     concat::{self, ConcatMethod},
     create_dir,
     determine_workers,
+    encoder::Encoder,
     ffmpeg::{compose_ffmpeg_pipe, get_num_frames},
     get_done,
-    get_encode_summary_stats,
     init_done,
     into_vec,
     log_merge::{capture_log_lines, LogMerger},
@@ -53,10 +53,8 @@ use crate::{
         update_progress_bar_estimates,
     },
     read_chunk_queue,
-    reset_encode_summary_stats,
     save_chunk_queue,
     scenes::{Scene, SceneFactory, ZoneOptions},
-    set_encode_summary_stats,
     settings::{EncodeArgs, InputPixelFormat},
     split::segment,
     vapoursynth::{create_vs_file, LoadscriptArgs},
@@ -131,7 +129,6 @@ impl Av1anContext {
         create_dir!(Path::new(&self.args.temp))?;
         create_dir!(Path::new(&self.args.temp).join("split"))?;
         create_dir!(Path::new(&self.args.temp).join("encode"))?;
-        reset_encode_summary_stats();
 
         debug!("temporary directory: {temp}", temp = &self.args.temp);
 
@@ -348,7 +345,6 @@ impl Av1anContext {
                     progress_file.write_all(serde_json::to_string(get_done())?.as_bytes())?;
 
                     if let Some(ref audio_output) = audio_output {
-                        // Line 405 in original
                         let audio_size = audio_output.metadata()?.len();
                         set_audio_size(audio_size);
                     }
@@ -411,11 +407,15 @@ impl Av1anContext {
                 project: self,
             };
 
-            let logs_path = Path::new(&self.args.temp).join("logs");
-            if !logs_path.exists() {
-                fs::create_dir_all(&logs_path).with_context(|| {
-                    format!("Failed to create logs directory in {}", logs_path.display())
-                })?;
+            if matches!(self.args.encoder, Encoder::x264 | Encoder::x265)
+                && self.args.params_indicate_logging()
+            {
+                let logs_path = Path::new(&self.args.temp).join("logs");
+                if !logs_path.exists() {
+                    fs::create_dir_all(&logs_path).with_context(|| {
+                        format!("Failed to create logs directory in {}", logs_path.display())
+                    })?;
+                }
             }
 
             let (tx, rx) = mpsc::channel();
@@ -444,12 +444,12 @@ impl Av1anContext {
             } else {
                 0.0
             };
-            set_encode_summary_stats(crate::EncodeSummaryStats {
+            let encode_summary_stats = crate::log_merge::EncodeSummaryStats {
                 total_frames,
                 media_seconds,
                 encode_seconds,
                 total_bytes,
-            });
+            };
 
             finish_progress_bar();
 
@@ -548,21 +548,29 @@ impl Av1anContext {
                     && self.args.params_indicate_logging()
                 {
                     info!("Merging log files...");
-                    let mut merger = LogMerger::new(&encoder_name);
+                    let mut merger =
+                        LogMerger::new(&encoder_name).with_output_file(&self.args.output_file);
                     let temp_path = Path::new(&self.args.temp);
 
                     let mut processed_count = 0;
                     for i in 0..total_chunks {
                         let log_path = temp_path.join("logs").join(format!("log_{}.log", i));
                         if log_path.exists() {
-                            processed_count += 1;
-                            if let Err(e) = merger.process_chunk(&log_path) {
-                                warn!("Failed to process log chunk {}: {}", i, e);
+                            match merger.process_chunk(&log_path) {
+                                Ok(()) => processed_count += 1,
+                                Err(e) => warn!("Failed to process log chunk {}: {}", i, e),
                             }
                         }
                     }
 
-                    info!("Processed {} log chunks.", processed_count);
+                    if processed_count == total_chunks {
+                        info!("Processed {} log chunks.", processed_count);
+                    } else {
+                        warn!(
+                            "Merged encoder log is incomplete: processed {}/{} chunk logs",
+                            processed_count, total_chunks
+                        );
+                    }
 
                     let output_log_path = if let Some(ref user_path) = self.args.user_log_file {
                         PathBuf::from(user_path)
@@ -575,15 +583,9 @@ impl Av1anContext {
 
                     match File::create(&output_log_path) {
                         Ok(log_file) => {
-                            let write_result = match get_encode_summary_stats() {
-                                Some(summary) => {
-                                    merger.write_merged_with_summary(log_file, &summary)
-                                },
-                                // The summary is only missing if av1an never got to
-                                // collect it, so fall back to the chunk logs alone.
-                                None => merger.write_merged(log_file),
-                            };
-                            if let Err(e) = write_result {
+                            if let Err(e) =
+                                merger.write_merged_with_summary(log_file, &encode_summary_stats)
+                            {
                                 warn!("Failed to write merged log: {}", e);
                             }
                         },
@@ -666,6 +668,23 @@ impl Av1anContext {
         if let Some(per_shot_target_quality_cq) = chunk.tq_cq {
             enc_cmd = chunk.encoder.man_command(enc_cmd, per_shot_target_quality_cq);
         }
+
+        let mut log_file = open_chunk_log_file(
+            Path::new(&chunk.temp),
+            chunk.index,
+            current_pass,
+            chunk.passes,
+            self.args.params_indicate_logging(),
+        )
+        .map_err(|e| {
+            (
+                anyhow::anyhow!(
+                    "Failed to create encoder log for chunk {}: {e}",
+                    chunk.index
+                ),
+                0,
+            )
+        })?;
 
         let (source_pipe_stderr, ffmpeg_pipe_stderr, enc_output, enc_stderr, frame) =
             thread::scope(|scope| -> Result<_, (anyhow::Error, u64)> {
@@ -846,16 +865,6 @@ impl Av1anContext {
                 let mut buf = Vec::with_capacity(128);
                 let mut enc_stderr = String::with_capacity(128);
 
-                let mut log_file = open_chunk_log_file(
-                    Path::new(&chunk.temp),
-                    chunk.index,
-                    current_pass,
-                    chunk.passes,
-                    self.args.params_indicate_logging(),
-                )
-                .ok()
-                .flatten();
-
                 while let Ok(read) = reader.read_until(b'\r', &mut buf) {
                     if read == 0 {
                         break;
@@ -867,7 +876,15 @@ impl Av1anContext {
                         // header and the statistics of the chunk
                         // are what the merged log is built from.
                         if let Some(f) = &mut log_file {
-                            let _ = capture_log_lines(line, f);
+                            capture_log_lines(line, f).map_err(|e| {
+                                (
+                                    anyhow::anyhow!(
+                                        "Failed to write encoder log for chunk {}: {e}",
+                                        chunk.index
+                                    ),
+                                    frame,
+                                )
+                            })?;
                         }
 
                         if self.args.verbosity == Verbosity::Verbose && !line.contains('\n') {
